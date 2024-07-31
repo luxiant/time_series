@@ -641,6 +641,7 @@ pub mod garch {
             eps: eps,
         };
 
+        // Nah, this does not work.
         // let lower_border = vec![-1.0; 1+p+q];
         // let upper_border = vec![1.0; 1+p+q];
         // let solver = ParticleSwarm::new((lower_border, upper_border), 10000);
@@ -648,6 +649,7 @@ pub mod garch {
         // let linesearch = MoreThuenteLineSearch::new().with_bounds(1e-8, f64::INFINITY).unwrap();
         // let solver = LBFGS::new(linesearch, 7);
 
+        // May natural to think initializing nelder mead optimization from acf, pacf coefficient.
         let mut initial_guesses = vec![init_params.clone()];
         for i in 0..init_params.len() {
             let mut new_guess = init_params.clone();

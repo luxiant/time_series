@@ -1,13 +1,12 @@
-use anyhow::Error;
 use ndarray::Array2;
 use linregress::{FormulaRegressionBuilder, RegressionDataBuilder};
 use statrs::{distribution::{ContinuousCDF, FisherSnedecor}, statistics::Statistics};
 use rand::prelude::{SeedableRng, StdRng};
 use rand_distr::{Distribution, Normal};
 use serde_json;
-// use serde::Deserialize;
-// use std::io;
-// use std::io::Read;
+use serde::Deserialize;
+use std::io;
+use std::io::Read;
 
 pub mod durbin_watson_test {
     use std::f64::consts::PI;
@@ -103,8 +102,9 @@ pub mod durbin_watson_test {
         let diff = &(res.t().slice(s![.., 1..])) - &(res.t().slice(s![.., ..-1]));
         let sum_diff_sq = diff.mapv(|x| x.powi(2)).sum();
         let sum_res_sq = res.mapv(|x| x.powi(2)).sum();
-    
-        (sum_diff_sq / sum_res_sq) as f64
+        let result = (sum_diff_sq / sum_res_sq) as f64;
+
+        result
     }
     
     pub fn dwtest_pan(res: Array2<f64>, x: Array2<f64>, matrix_inverse: bool, n: i32) -> (f64, f64) {
@@ -152,22 +152,21 @@ pub mod durbin_watson_test {
         for i in 1..n_obs-1 {
             ax_matrix.row_mut(i).assign(&(&x.row(i) * 2.0 - &x.row(i-1) - &x.row(i+1)));
         }
-    
+
         // Calculate AXR matrix
         let axr_matrix: ArrayBase<OwnedRepr<f64>, Dim<[usize; 2]>> = if matrix_inverse {
             let r_matrix: ArrayBase<OwnedRepr<f64>, Dim<[usize; 2]>> = x.t().dot(&x).inv().unwrap();
             ax_matrix.dot(&r_matrix)
         } else {
-            let a_matrix: ArrayBase<OwnedRepr<f64>, Dim<[usize; 2]>> = x.t().dot(&x);
+            let a_matrix: ArrayBase<OwnedRepr<f64>, Dim<[usize; 2]>> = x.dot(&x.t());
             let ax_t_matrix = ax_matrix.t();
-            // get axr that makes sqaure of a_matrix * axr = ax_matrix.t() least.
             let a_matrix_dmatrix = DMatrix::from_iterator(a_matrix.nrows(), a_matrix.ncols(), a_matrix.iter().map(|x| *x));
             let ax_t_dmatrix_dmatrix = DMatrix::from_iterator(ax_t_matrix.nrows(), ax_t_matrix.ncols(), ax_t_matrix.iter().map(|x| *x));
             let a_matrix_dmatrix_pseudo_inverse = a_matrix_dmatrix.pseudo_inverse(1e-6).unwrap();
-            let axr_dmatrix = a_matrix_dmatrix_pseudo_inverse * ax_t_dmatrix_dmatrix;
+            let axr_dmatrix = a_matrix_dmatrix_pseudo_inverse * ax_t_dmatrix_dmatrix.transpose();
             Array2::from_shape_fn((axr_dmatrix.nrows(), axr_dmatrix.ncols()), |(i, j)| axr_dmatrix[(i, j)])
         };
-    
+
         // Calculate B matrix
         let b_matrix = x.t().dot(&axr_matrix);
         let p_matrix_value = 2.0 * (n_obs as f64 - 1.0) - b_matrix.trace().unwrap();
@@ -188,19 +187,19 @@ pub mod durbin_watson_test {
                 (p_right, dw)
             }
         } else if method == "normal" {
-            (dw_stat(res.clone()), -1.0)
+            (-1.0, dw_stat(res.clone()))
         } else {
             // error: no such method
             (-1.0, -1.0)
         };
-    
+
         if p_right < 0.0 {
             // use normal approximation
             let (dw_mean, dw_var) = dw_meanvar(x.clone(), matrix_inverse);
             let normal = Normal::new(0.0, 1.0).unwrap();
             p_right = normal.cdf((dw - dw_mean) / dw_var.sqrt());
         }
-    
+
         let p_val = match tail {
             "both" => 2.0 * p_right.min(1.0 - p_right),
             "right" => p_right,
@@ -216,25 +215,31 @@ pub mod find_p_d_q {
     use unit_root::prelude::distrib::{AlphaLevel, Regression};
     use unit_root::prelude::*;
     use ndarray::Array2;
+    use crate::arima;
     
-    pub fn find_adequate_diff(data: Array2<f64>, start_diff: i32) -> i32 {
+    pub fn find_adequate_diff(data: Array2<f64>, start_diff: i32) -> Option<i32> {
         let data_vec = data.clone().into_raw_vec();
         let data_slice = data_vec.as_slice();
         let mut diff = start_diff;
         let y = nalgebra::DVector::from_row_slice(&data_slice);
         let regression = Regression::Constant;
-        let report = tools::adf_test(&y, diff as usize, regression).unwrap();
-        let critical_value = distrib::dickeyfuller::get_critical_value(regression, report.size, AlphaLevel::FivePercent).unwrap();
-        let t_stat = report.test_statistic;
-        if t_stat >= critical_value {
-            diff += 1;
-            find_adequate_diff(data, diff)
-        } else {
-            diff
+        let report = tools::adf_test(&y, diff as usize, regression);
+        match report {
+            Ok(report) => {
+                let critical_value: f64 = distrib::dickeyfuller::get_critical_value(regression, report.size, AlphaLevel::FivePercent).unwrap();
+                let t_stat = report.test_statistic;
+                if t_stat.abs() >= critical_value.abs() {
+                    diff += 1;
+                    find_adequate_diff(data, diff)
+                } else {
+                    Some(diff)
+                }
+            },
+            Err(_) => None,
         }
     }
 
-    pub fn find_adequate_p(data: Array2<f64>) -> i32 {
+    pub fn find_adequate_p(data: Array2<f64>) -> (i32, Vec<f64>) {
         let len_data = data.nrows();
         let data_vec = data.clone().into_raw_vec();
         let data_slice = data_vec.as_slice();
@@ -244,14 +249,14 @@ pub mod find_p_d_q {
         for i in 0..pacfs.len() {
             if pacfs[i].abs() > max_pacf.abs() {
                 max_pacf = pacfs[i];
-                max_p = i as i32;
+                max_p = (i+1) as i32;
             }
         }
         
-        max_p
+        (max_p, pacfs)
     }
 
-    pub fn find_adequate_q(data: Array2<f64>) -> i32 {
+    pub fn find_adequate_q(data: Array2<f64>) -> (i32, Vec<f64>) {
         let len_data = data.nrows();
         let data_vec = data.clone().into_raw_vec();
         let data_slice = data_vec.as_slice();
@@ -261,22 +266,20 @@ pub mod find_p_d_q {
             if acfs[i] <= 0.0 {
                 break;
             } else {
-                max_q = i as i32;
+                max_q = (i+1) as i32;
             }
         }
 
-        max_q
+        (max_q, acfs)
     }
 }
 
 pub mod arima {
     use anyhow::Result;
     use std::cmp;
-    use rand::distributions::{Distribution, Normal};
-    use rand::{thread_rng, Rng};
-    use ndarray::{Array1, Array2};
-    use ndarray_linalg::Inverse;
-    use ndarray_stats::SummaryStatisticsExt;
+    use rand_distr::{Normal, Distribution};
+    use rand::thread_rng;
+    use ndarray::Array1;
 
     pub fn acf(data: &[f64], max_lag: Option<usize>, covariance: bool) -> Result<Vec<f64>> {
         let max_lag = match max_lag {
@@ -285,21 +288,18 @@ pub mod arima {
         };
         let acf_total_len = max_lag + 1;
 
-        let data_len = data.len();
-        let data_len_clone = data_len.clone();
         let mut sum = 0.0;
-        for i in 0..data_len {
+        for i in 0..data.len() {
             sum += data[i]
         }
-        let data_mean = sum / (data_len_clone as f64);
+        let data_mean = sum / (data.len() as f64);
 
         let mut y = vec![0.0; acf_total_len];
         for m in 0..acf_total_len {
-            for i in 0..(data_len-m) {
-                let data_len_clone = data_len.clone();
+            for i in 0..(data.len()-m) {
                 let i_th_deviation = data[i] - data_mean;
                 let i_t_th_deviation = data[i+m] - data_mean;
-                y[m] += (i_th_deviation * i_t_th_deviation) / (data_len_clone as f64);
+                y[m] += (i_th_deviation * i_t_th_deviation) / (data.len() as f64);
             }
             if !covariance && m > 0 {
                 y[m] = y[m]/y[0];
@@ -314,45 +314,66 @@ pub mod arima {
             Some(max_lag) => cmp::min(max_lag, data.len() - 1),
             None => data.len() - 1,
         };
-
+        let pacf_total_len = max_lag + 1;
         let max_lag_clone = max_lag.clone();
-        let mut pacf_values = Array1::zeros(max_lag_clone+1);
-        pacf_values[0] = 1.0;
+        let rho = acf(data, Some(max_lag_clone), true).unwrap();
+        let cov0 = acf(data, Some(0), true).unwrap()[0];
 
-        for lag in 1..max_lag {
-            let mut x = Array2::<f64>::zeros((lag, lag));
-            let mut y = Array1::<f64>::zeros(lag);
-    
-            for i in 0..lag {
-                for j in 0..lag {
-                    x[(i, j)] = data[(lag - 1 - i) as usize];
+        let mut result_coef: Vec<f64> = Vec::new();
+
+        for i in 1..pacf_total_len {
+            let order = cmp::min(i, rho.len() - 1);
+            let mut phi: Vec<Vec<f64>> = vec![Vec::new(); order+1];
+            let mut var: Vec<f64> = Vec::new();
+
+            phi[0].push(0.0);
+            let cov0_clone = cov0.clone();
+            var.push(cov0_clone);
+
+            for j in 1..order+1 {
+                for _ in 0..j {
+                    phi[j].push(0.0);
                 }
-                y[i] = data[lag + i];
+
+                let mut num_sum = 0.0;
+                let mut den_sum = 1.0;
+
+                for k in 1..j {
+                    let p = phi[j-1][k-1];
+                    num_sum += p*rho[j-k];
+                    den_sum += -p*rho[k];
+                }
+
+                let phi_jj = (rho[j]-num_sum)/den_sum;
+                phi[j][j-1] = phi_jj;
+
+                var.push(var[j-1]*(1.0 - phi_jj*phi_jj));
+
+                for k in 1..j {
+                    phi[j][k-1] = phi[j-1][k-1] - phi[j][j-1]*phi[j-1][j-k-1];
+                }
             }
-    
-            let x_inv = x.inv().unwrap();
-            let coef = x_inv.dot(&y);
-            pacf_values[lag] = coef[lag - 1];
+
+            let coef = phi[order].clone();
+            
+            result_coef.push(coef[i-1]);
         }
 
-        let result_pacf = pacf_values.into_raw_vec();
-
-        Ok(result_pacf)
+        Ok(result_coef)
     }
 
     pub fn difference(data: &[f64], d: usize) -> Vec<f64> {
-        let data_clone = data.clone();
-        let mut diff = vec![0.0; data_clone.len()-d];
-        for i in d..data_clone.len() {
+        let mut diff = vec![0.0; data.len()-d];
+        for i in d..data.len() {
             diff[i-d] = data[i] - data[i-d];
         }
 
         diff
     }
 
-    pub fn fit_arima(data: &[f64], p: usize, d: usize, q: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, bool) {
+    pub fn fit(data: &[f64], p: usize, d: usize, q: usize, _init_params: Vec<f64>) -> (Vec<f64>, Vec<f64>, Vec<f64>, bool) {
         let differenced_data = if d == 0 as usize {
-            data.clone().to_vec()
+            data.to_vec()
         } else {
             difference(data, d).as_slice().to_vec()
         };
@@ -366,7 +387,9 @@ pub mod arima {
         };
 
         // initialize coef and residuals for durbin recursion
-        let mut residuals_hat = vec![1.0;differenced_data.len()-max_lag];
+        let hat_len = differenced_data.len()-max_lag;
+        let mut residuals_hat = vec![1.0; hat_len];
+        let mut data_hat = vec![0.0; hat_len];
 
         let mut data_sum = 0.0;
         for i in 0..differenced_data.len() {
@@ -377,20 +400,22 @@ pub mod arima {
         let mut ar_coef = vec![1.0; p];
         let mut ma_coef = vec![1.0; q];
 
-        // durbin's recursion method
-        let max_iter = 100000;
+        // durbin recursion method
+        let max_iter = 1000;
         let tol = 1e-6;
 
-        let mut data_hat = vec![0.0; differenced_data.len()-max_lag];
-        
         for i in 0..max_iter {
-            for t in max_lag..differenced_data.len() {
+            let residuals_mean = residuals_hat.iter().sum::<f64>()/(residuals_hat.len() as f64);
+            for t in 0..q {
+                residuals_hat[t] = residuals_mean;
+            }
+            for t in q..hat_len {
                 let mut x_t = 0.0;
                 for ar_i in 0..ar_coef.len() {
-                    x_t += ar_coef[ar_i]*differenced_data[t-ar_i-1];
+                    x_t += ar_coef[ar_i]*differenced_data[t+max_lag-ar_i-1];
                 }
                 for ma_i in 0..ma_coef.len() {
-                    x_t += ma_coef[ma_i]*residuals_hat[t-ma_i-1];
+                    x_t += ma_coef[ma_i]*residuals_hat[t-ma_i];
                 }
                 x_t += intercept;
                 data_hat[t] = x_t;
@@ -400,19 +425,20 @@ pub mod arima {
             let mut new_ar_coef = vec![0.0; ar_coef.len()];
             let mut new_ma_coef = vec![0.0; ma_coef.len()];
             for i in 0..ar_coef.len() {
-                let numerator_phi: f64 = (i+1..differenced_data.len()).map(|t| differenced_data[t] * differenced_data[t-i-1]).sum();
-                let denominator_phi: f64 = (i+1..differenced_data.len()).map(|t| differenced_data[t-i-1] * differenced_data[t-i-1]).sum();
+                let numerator_phi: f64 = (i+1..hat_len).map(|t| differenced_data[t+max_lag] * differenced_data[t+max_lag-i-1]).sum();
+                let denominator_phi: f64 = (i+1..hat_len).map(|t| differenced_data[t+max_lag-i-1] * differenced_data[t+max_lag-i-1]).sum();
                 new_ar_coef[i] = numerator_phi / denominator_phi;
             }
             for i in 0..ma_coef.len() {
-                let numerator_theta: f64 = (i+1..differenced_data.len()).map(|t| residuals_hat[t] * residuals_hat[t-i-1]).sum();
-                let denominator_theta: f64 = (i+1..differenced_data.len()).map(|t| residuals_hat[t-i-1] * residuals_hat[t-i-1]).sum();
+                let numerator_theta: f64 = (i+1..hat_len).map(|t| residuals_hat[t] * residuals_hat[t-i-1]).sum();
+                let denominator_theta: f64 = (i+1..hat_len).map(|t| residuals_hat[t-i-1] * residuals_hat[t-i-1]).sum();
                 new_ma_coef[i] = numerator_theta / denominator_theta;
             }
 
             let ar_coef_diff: f64 = new_ar_coef.iter().zip(&ar_coef).map(|(e, p)| (e - p).abs()).sum();
             let ma_coef_diff: f64 = new_ma_coef.iter().zip(&ma_coef).map(|(e, p)| (e - p).abs()).sum();
             if ar_coef_diff.abs() < tol && ma_coef_diff.abs() < tol {
+                fitted = true;
                 break;
             } else {
                 ar_coef = new_ar_coef.clone();
@@ -432,12 +458,20 @@ pub mod arima {
             result_coef.push(ma_coef[i]);
         }
 
-        let mut hat_undifferentiated = vec![0.0; data_hat.len()+d];
+        let mut hat_differentiated = vec![0.0; differenced_data.len()];
+        for i in 0..max_lag {
+            hat_differentiated[i] = differenced_data[i];
+        }
+        for i in max_lag..differenced_data.len() {
+            hat_differentiated[i] = data_hat[i-max_lag];
+        }
+
+        let mut hat_undifferentiated = vec![0.0; hat_differentiated.len()+d];
         for i in 0..d {
             hat_undifferentiated[i] = data[i];
         }
         for i in 0..data_hat.len() {
-            hat_undifferentiated[i+d] = hat_undifferentiated[i] + data_hat[i];
+            hat_undifferentiated[i+d] = hat_undifferentiated[i] + hat_differentiated[i];
         }
 
         (result_coef, hat_undifferentiated, residuals_hat, fitted)
@@ -445,19 +479,26 @@ pub mod arima {
 
     pub fn forecast(simulated_data: &[f64], residuals_hat: &[f64], coef: Vec<f64>, p: usize, d: usize, q: usize, simulation_length: usize) -> Vec<f64> {
         let mut differenced_data = if d == 0 as usize {
-            simulated_data.clone().to_vec()
+            simulated_data.to_vec()
         } else {
             difference(simulated_data, d).as_slice().to_vec()
         };
-        let mut residuals_hat_clone = residuals_hat.clone().to_vec();
+        let residuals_hat_clone = residuals_hat.to_vec();
         let residual_vec_for_stat = Array1::from(residuals_hat_clone);
         let residual_mean = residual_vec_for_stat.mean().unwrap();
         let residual_std = residual_vec_for_stat.std(0.0);
 
-        let mut residuals_hat_clone = residuals_hat.clone().to_vec();
+        let mut residuals_hat_clone = residuals_hat.to_vec();
         let intercept = coef[0];
         let ar_coef = coef[1..1+p].to_vec();
         let ma_coef = coef[1+p..1+p+q].to_vec();
+
+        for _ in 0..simulation_length {
+            let normal = Normal::new(residual_mean, residual_std).unwrap();
+            let mut rng = thread_rng();
+            let random_number = normal.sample(&mut rng);
+            residuals_hat_clone.push(random_number);
+        }
 
         for t in 0..simulation_length {
             let mut x_t = 0.0;
@@ -465,275 +506,34 @@ pub mod arima {
                 x_t += ar_coef[ar_i]*differenced_data[differenced_data.len()+t-ar_i-1];
             }
             for ma_i in 0..ma_coef.len() {
-                x_t += ma_coef[ma_i]*residuals_hat_clone[differenced_data.len()+t-ma_i-1];
+                x_t += ma_coef[ma_i]*residuals_hat_clone[residuals_hat.len()+t-ma_i-1];
             }
             x_t += intercept;
             differenced_data.push(x_t);
-
-            let normal = Normal::new(residual_mean, residual_std);
-            let mut rng = thread_rng();
-            let random_number = normal.sample(&mut rng);
-            residuals_hat_clone.push(random_number);
         }
 
         let mut hat_undifferentiated = vec![0.0; differenced_data.len()+d];
         for i in 0..d {
-            hat_undifferentiated[i] = data[i];
+            hat_undifferentiated[i] = differenced_data[i];
         }
         for i in 0..differenced_data.len() {
             hat_undifferentiated[i+d] = hat_undifferentiated[i] + differenced_data[i];
         }
 
-        let result = hat_undifferentiated[hat_undifferentiated.len()-simulation_length..];
+        let result = hat_undifferentiated[hat_undifferentiated.len()-simulation_length..].to_vec();
 
         result
     }
-
-    // pub fn fit_ar(data: &[f64], p: usize) -> Result<Vec<f64>> {
-    //     let data_clone = data.clone();
-    //     let data_len = data_clone.len();
-    //     let mut x = Array2::<f64>::zeros(((data_len-p), p));
-    //     let mut y = Array1::<f64>::zeros(data_len-p);
-
-    //     for i in 0..(data_len - p) {
-    //         for j in 0..p {
-    //             x[(i, j)] = data[i + j];
-    //         }
-    //         y[i] = data[i + p];
-    //     }
-    
-    //     let svd_solver_result = x.least_squares(&y).unwrap();
-    //     let mut coef = svd_solver_result.solution.into_raw_vec();
-
-    //     let data_clone = data.clone();
-    //     let data_len = data_clone.len();
-    //     let coef_clone = coef.clone();
-    //     let p_clone = p.clone();
-    //     let y_ar_hat = ar_simulation(data_clone, coef_clone, p_clone);
-    //     let mut residual_containing_intercept: Vec<f64> = Vec::with_capacity(data_len-p);
-    //     let data_clone = data.clone();
-    //     let data_len = data_clone.len();
-    //     for i in 0..data_len {
-    //         residual_containing_intercept.push(data[i] - y_ar_hat[i]);
-    //     }
-    //     let get_residuals_in_only_simulated_part = residual_containing_intercept[p..].to_vec();
-        
-    //     let mut sum = 0.0;
-    //     for i in 0..get_residuals_in_only_simulated_part.len() {
-    //         sum += get_residuals_in_only_simulated_part[i]
-    //     }
-    //     let intercept = sum/(get_residuals_in_only_simulated_part.len() as f64);
-    //     coef.push(intercept);
-
-    //     Ok(coef)
-    // }
-
-    // pub fn fit_ar(data: &[f64], p: usize) -> Vec<f64> {
-    //     let mut r: Vec<f64> = Vec::new();
-    //     let mut sum_of_squares_data = 0.0;
-    //     for i in 0..data.len() {
-    //         sum_of_squares_data += data[i] * data[i];
-    //     }
-    //     let mean_of_squares_data = sum_of_squares_data / (data.len() as f64);
-
-    //     for j in 1..(p+1) {
-    //         let mut sum_squares = 0.0;
-    //         for i in 0..(data.len()-j) {
-    //             sum_squares += data[i]*data[i+j];                
-    //         }
-    //         let mean_squares = sum_squares/(data.len() as f64);
-    //         r[j] = mean_squares;
-    //     }
-
-    //     let r_slice = r[..p].to_vec();
-
-    //     let mut vector_form_toeplitz_matrix: Vec<Vec<f64>> = Vec::new();
-    //     for i in 0..p {
-    //         let insert = vec![0.0; p];
-    //         vector_form_toeplitz_matrix.push(insert);
-    //     }
-
-    //     for i in 0..p {
-    //         for j in 0..p {
-    //             if j >= i {
-    //                 vector_form_toeplitz_matrix[i][j] = r_slice[j-i];
-    //             } else {
-    //                 vector_form_toeplitz_matrix[i][j] = r_slice[i-j];
-    //             }
-    //         }
-    //     }
-
-    //     let r_vec = r[1..p+1].to_vec();
-        
-    //     // cholesky LDLT decomposition
-    //     fn signum(value: f64) -> i32 {
-    //         if value > 0.0 {
-    //             1
-    //         } else if value < 0.0 {
-    //             -1
-    //         } else {
-    //             0
-    //         }
-    //     }
-
-    //     fn cholesky_ldlt_decomposition(matrix: &Vec<Vec<f64>>, max_condition_number: f64) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
-    //         let n = matrix.len();
-    //         let mut chol_d = vec![0.0; n];
-    //         let mut chol_l = vec![vec![0.0; n]; n];
-        
-    //         let mut current_max = -1.0;
-        
-    //         for j in 0..n {
-    //             let mut val = 0.0;
-    //             for k in 0..j {
-    //                 val += chol_d[k] * chol_l[j][k] * chol_l[j][k];
-    //             }
-    //             let mut diag_temp = matrix[j][j] - val;
-    //             let diag_sign = signum(diag_temp);
-        
-    //             if diag_sign == 0 && max_condition_number < -0.5 {
-    //                 return None;
-    //             }
-
-    //             if max_condition_number > -0.5 {
-    //                 if current_max <= 0.0 {
-    //                     if diag_sign == 0 {
-    //                         diag_temp = 1.0;
-    //                     }
-    //                 } else {
-    //                     if diag_sign == 0 {
-    //                         diag_temp = (current_max / max_condition_number).abs();
-    //                     } else {
-    //                         if (diag_temp * max_condition_number).abs() < current_max {
-    //                             diag_temp = diag_sign as f64 * (current_max / max_condition_number).abs();
-    //                         }
-    //                     }
-    //                 }
-    //             }
-        
-    //             chol_d[j] = diag_temp;
-    //             if diag_temp.abs() > current_max {
-    //                 current_max = diag_temp.abs();
-    //             }
-    //             chol_l[j][j] = 1.0;
-        
-    //             for i in (j+1)..n {
-    //                 val = 0.0;
-    //                 for k in 0..j {
-    //                     val += chol_d[k] * chol_l[j][k] * chol_l[i][k];
-    //                 }
-    //                 chol_l[i][j] = (matrix[i][j] - val) / chol_d[j];
-    //             }
-    //         }
-        
-    //         Some((chol_d, chol_l))
-    //     }
-
-    //     let (chol_d, chol_l) = cholesky_ldlt_decomposition(&vector_form_toeplitz_matrix, 100.0).unwrap();
-
-    //     let mut y: Vec<f64> = vec![0.0; p];
-    //     let mut yule_walker: Vec<f64> = r_vec.clone();
-        
-    //     for i in 0..p {
-    //         let mut val = 0.0;
-    //         for j in 0..i {
-    //             val += chol_l[i][j]*y[j];
-    //         }
-    //         y[i] = yule_walker[i] - val;
-    //     }
-
-    //     for i in (0..p-1).rev() {
-    //         let mut val = 0.0;
-    //         for j in i+1..p {
-    //             val += chol_l[i][j]*yule_walker[j];
-    //         }
-    //         yule_walker[i] = (yule_walker[i]/chol_d[i]) - val;
-    //     }
-
-    //     yule_walker
-    // }
-
-    // pub fn ar_simulation(data: &[f64], coef: Vec<f64>, lag: usize) -> Vec<f64> {
-    //     let data_clone = data.clone();
-    //     let data_len = data_clone.len();
-
-    //     let mut starting_data = data[0..lag].to_vec();
-        
-    //     fn serial_recursion(starting_data: &mut Vec<f64>, coef: Vec<f64>, simulation_len: usize) -> &mut Vec<f64> {
-    //         let data_clone = starting_data.clone();
-    //         let data_len = data_clone.len();
-    //         let coef_clone = coef.clone();
-    //         let p = coef_clone.len();
-            
-    //         let mut hat = 0.0;
-    //         for i in 0..p {
-    //             hat += coef[i]*starting_data[data_len-i];
-    //         }
-    //         starting_data.push(hat);
-
-    //         let starting_data_clone = starting_data.clone();
-    //         let starting_data_len = starting_data_clone.len();
-    //         if starting_data_len == simulation_len {
-    //             starting_data
-    //         } else {
-    //             let simulated_data = serial_recursion(starting_data, coef, simulation_len);
-    //             simulated_data
-    //         }
-    //     }
-
-    //     let simulated_hat = serial_recursion(&mut starting_data, coef, data_len);
-
-    //     simulated_hat.clone()
-    // }
-
-    // pub fn fit_ma(data: &[f64], errors: &[f64], q: usize) -> Result<Vec<f64>> {
-    //     let data_clone = data.clone();
-    //     let data_len = data_clone.len();
-    //     let mut x = Array2::<f64>::zeros(((data_len-q), q));
-    //     let mut y = Array1::<f64>::zeros(data_len-q);
-
-    //     for i in 0..(data_len - q) {
-    //         for j in 0..q {
-    //             x[(i, j)] = data[i + j];
-    //         }
-    //         y[i] = data[i + q];
-    //     }
-
-    //     let svd_solver_result = x.least_squares(&y).unwrap();
-    //     let coef = svd_solver_result.solution.into_raw_vec();
-
-    //     Ok(coef)
-    // }
-
-    // pub fn ma_simulation(data: &[f64], errors: &[f64], coef: Vec<f64>, lag: usize) -> Vec<f64> {
-    //     let data_clone = data.clone();
-    //     let data_len = data_clone.len();
-
-    //     let mut starting_data = data[0..lag].to_vec();
-
-    //     let coef_clone = coef.clone();
-    //     let q = coef_clone.len();
-
-    //     let mut simulated_hat: Vec<f64> = Vec::new();
-    //     for _ in lag..data_len {
-    //         let mut hat = 0.0;
-    //         for k in 0..q {
-    //             hat += coef[k]*data[data_len-q+k]
-    //         }
-    //         simulated_hat.push(hat);
-    //     }
-
-    //     simulated_hat
-    // }
 }
 
 pub mod garch {
     use anyhow::Error;
     use rand::Rng;
-    // use rustimization::lbfgsb_minimizer::Lbfgsb;
     // use finitediff::FiniteDiff;
     use argmin::core::{CostFunction, State, Executor};
-    use argmin::solver::particleswarm::ParticleSwarm;
+    use argmin::solver::neldermead::NelderMead;
+    // use argmin::solver::{linesearch::MoreThuenteLineSearch, quasinewton::LBFGS};
+    // use argmin::solver::particleswarm::ParticleSwarm;
 
     pub fn mean(x: &Vec<f64>) -> f64 {
         let n = x.len() as f64;
@@ -788,7 +588,7 @@ pub mod garch {
         -loglik
     }
 
-    pub fn fit(ts: &Vec<f64>, p: usize, q: usize) -> Option<Vec<f64>> {
+    pub fn fit(ts: &Vec<f64>, p: usize, q: usize, init_params: Vec<f64>) -> Option<Vec<f64>> {
         let mean = mean(ts);
         let eps: Vec<f64> = ts.iter().map(|x| x - mean).collect();
     
@@ -816,6 +616,23 @@ pub mod garch {
             }
         }
 
+        // impl Gradient for StructForGarchFit {
+        //     type Param = Vec<f64>;
+        //     type Gradient = Vec<f64>;
+
+        //     fn gradient(&self, coef: &Self::Param) -> Result<Self::Gradient, Error> {
+        //         let f = |coef: &Vec<f64>| {
+        //             let omega = coef[0];
+        //             let alpha = &coef[1..self.p+1];
+        //             let beta = &coef[self.p+1..];
+        //             let sigma_2 = garch_recursion(omega, &alpha, &beta, &self.eps);
+        //             neg_loglikelihood(&sigma_2, &self.eps)
+        //         };
+
+        //         Ok(coef.forward_diff(&f))
+        //     }
+        // }
+
         let p_clone = p.clone();
         let q_clone = q.clone();
         let cost = StructForGarchFit {
@@ -824,22 +641,41 @@ pub mod garch {
             eps: eps,
         };
 
-        let lower_border = vec![-1.0; 1+p+q];
-        let upper_border = vec![1.0; 1+p+q];
-        let solver = ParticleSwarm::new((lower_border, upper_border), 10000);
+        // let lower_border = vec![-1.0; 1+p+q];
+        // let upper_border = vec![1.0; 1+p+q];
+        // let solver = ParticleSwarm::new((lower_border, upper_border), 10000);
     
-        let result = Executor::new(cost, solver)
-        .configure(|state| state.max_iters(300))
-        .run().unwrap();
+        // let linesearch = MoreThuenteLineSearch::new().with_bounds(1e-8, f64::INFINITY).unwrap();
+        // let solver = LBFGS::new(linesearch, 7);
 
-        let coef_option = result.state().get_best_param().unwrap().into();
-        match coef_option {
-            Some(x) => {
-                let x_clone = x.clone();
-                let result_coef = x_clone.position;
-                Some(result_coef)
+        let mut initial_guesses = vec![init_params.clone()];
+        for i in 0..init_params.len() {
+            let mut new_guess = init_params.clone();
+            new_guess[i] = new_guess[i] + 0.01;
+            initial_guesses.push(new_guess);
+        }
+        let solver = NelderMead::new(initial_guesses).with_sd_tolerance(1e-6).unwrap();
+
+        let result = Executor::new(cost, solver)
+        .configure(
+            |state| state.max_iters(300)
+            // |state| state.max_iters(300).param(init_params)
+        )
+        .run();
+        match result {
+            Ok(result) => {
+                let coef_option = result.state().get_best_param().unwrap().into();
+                match coef_option {
+                    Some(x) => {
+                        let x_clone = x.clone();
+                        // let result_coef = x_clone.position;
+                        // Some(result_coef)
+                        Some(x_clone)
+                    },
+                    None => None,
+                }
             },
-            None => None,
+            Err(_) => None,
         }
     }
 
@@ -928,41 +764,25 @@ fn akaike_information_criterion(num_params: f64, data: Array2<f64>) -> f64 {
     aic
 }
 
-fn fit_residuals_arima(residuals_array: Array2<f64>, p: i32, d: i32, q: i32) -> Result<(f64, Vec<f64>, Array2<f64>), Error> {
+fn fit_residuals_arima(residuals_array: Array2<f64>, p: i32, d: i32, q: i32, init_params: Vec<f64>) -> Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)> {
     let residuals_array_vec = residuals_array.clone().into_raw_vec();
     let residuals_slice = residuals_array_vec.as_slice();
-    let (coef, hat_undifferentiated, residuals_hat, fitted) = arima::fit_arima(residuals_slice, p as usize, d as usize, q as usize);
+    let (coef, hat_undifferentiated, residuals_hat, fitted) = arima::fit(residuals_slice, p as usize, d as usize, q as usize, init_params);
     
-    match coef {
-        Ok(coef) => {
-            let num_params = coef.len() as f64;
-            let aic = akaike_information_criterion(num_params, residuals_array.clone());
-            let mut rng: StdRng = SeedableRng::from_seed([0; 32]);
-            let normal = Normal::new(0.0, 1.0).unwrap();
-            let resid_hat = sim::arima_sim(
-                residuals_array.len(),
-                Some(&coef[1..((p+1) as usize)]),
-                if q > 0 {Some(&coef[((p+1) as usize)..((p+q) as usize)])} else {None},
-                d as usize,
-                &|mut rng| normal.sample(&mut rng),
-                &mut rng,
-            );
-            match resid_hat {
-                Ok(resid_hat) => {
-                    let resid_hat_array2 = Array2::from_shape_vec((resid_hat.len(), 1), resid_hat).unwrap();
-                    Ok((aic, coef, resid_hat_array2))
-                },
-                Err(e) => Err(e)
-            }
-        },
-        Err(e) => Err(e)
+    if fitted {
+        let num_params = coef.len() as f64;
+        let aic = akaike_information_criterion(num_params, residuals_array.clone());
+        
+        Some((aic, coef, hat_undifferentiated, residuals_hat))
+    } else {
+        None
     }
 }
 
-fn fit_residuals_garch(residuals_array: Array2<f64>, p: i32, q: i32) -> Option<(f64, Vec<f64>, Array2<f64>)>{
+fn fit_residuals_garch(residuals_array: Array2<f64>, p: i32, q: i32, init_params: Vec<f64>) -> Option<(f64, Vec<f64>, Array2<f64>)>{
     let residuals_array_vec = residuals_array.clone().into_raw_vec();
     let residuals_slice = residuals_array_vec.clone();
-    let coef_option = garch::fit(&residuals_slice, p as usize, q as usize);
+    let coef_option = garch::fit(&residuals_slice, p as usize, q as usize, init_params);
     match coef_option {
         Some(coef) => {
             let num_params = coef.len() as f64;
@@ -982,141 +802,261 @@ fn fit_residuals_garch(residuals_array: Array2<f64>, p: i32, q: i32) -> Option<(
     }
 }
 
-fn fit_residuals(rediduals_array: Array2<f64>, is_it_autocorrelated: bool, is_it_heteroskedastic: bool) -> (String, Vec<f64>, Vec<i32>, Array2<f64>) {
+fn fit_residuals(rediduals_array: Array2<f64>, is_it_autocorrelated: bool, is_it_heteroskedastic: bool) -> Option<(String, Vec<f64>, Vec<i32>, Array2<f64>)> {
     let residuals_array = rediduals_array.clone();
     let mut result_fitted_residuals: Array2<f64> = Array2::zeros((residuals_array.clone().len(), 1));
-    let model_type: String;
+    let mut _fitted = false;
+    let mut model_type: String;
     let mut coef: Vec<f64> = vec![];
     let mut p_d_q = vec![];
-    if is_it_autocorrelated && !is_it_heteroskedastic {
-        model_type = "arima".to_string();
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_p = find_p_d_q::find_adequate_p(residuals_array_clone);
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_diff = find_p_d_q::find_adequate_diff(residuals_array_clone, 0);
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_q = find_p_d_q::find_adequate_q(residuals_array_clone);
-
-        let mut best_q = 0;
-        let best_aic = f64::INFINITY;
-        for i in 0..(adequate_q+1) {
-            let residuals_array_clone = residuals_array.clone();
-            match fit_residuals_arima(residuals_array_clone, adequate_p, adequate_diff, i) {
-                Ok((aic, get_coef, resid_hat)) => {
-                    if aic < best_aic {
-                        best_q = i;
-                        result_fitted_residuals = resid_hat;
-                        coef = get_coef;
-                    } else {
-                        continue;
-                    }
-                },
-                Err(_) => continue
-            }
-        }
-
-        p_d_q.push(adequate_p);
-        p_d_q.push(adequate_diff);
-        p_d_q.push(best_q);
-    } else if !is_it_autocorrelated && is_it_heteroskedastic {
-        model_type = "garch".to_string();
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_p = find_p_d_q::find_adequate_p(residuals_array_clone);
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_q = find_p_d_q::find_adequate_q(residuals_array_clone);
-
-        let mut best_q = 0;
-        let best_aic = f64::INFINITY;
-        for i in 0..(adequate_q+1) {
-            let residuals_array_clone = residuals_array.clone();
-            match fit_residuals_garch(residuals_array_clone, adequate_p, i) {
-                Some((aic, get_coef, resid_hat)) => {
-                    if aic < best_aic {
-                        best_q = i;
-                        result_fitted_residuals = resid_hat;
-                        coef = get_coef;
-                    } else {
-                        continue;
-                    }
-                },
-                None => continue
-            }
-        }
-
-        p_d_q.push(adequate_p);
-        p_d_q.push(0);
-        p_d_q.push(best_q);
-    } else {
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_diff = find_p_d_q::find_adequate_diff(residuals_array_clone, 0);
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_p = find_p_d_q::find_adequate_p(residuals_array_clone);
-        let residuals_array_clone = residuals_array.clone();
-        let adequate_q = find_p_d_q::find_adequate_q(residuals_array_clone);
-        
-        let mut best_q_arima = 0;
-        let mut best_fit_residuals_arima: Array2<f64> = Array2::zeros((residuals_array.clone().len(), 1));
-        let mut best_arima_coef: Vec<f64> = vec![];
-        let best_aic_arima = f64::INFINITY;
-        for i in 0..(adequate_q+1) {
-            let residuals_array_clone = residuals_array.clone();
-            match fit_residuals_arima(residuals_array_clone, adequate_p, adequate_diff, i) {
-                Ok((aic, arima_coef, resid_hat)) => {
-                    if aic < best_aic_arima {
-                        best_q_arima = i;
-                        best_arima_coef = arima_coef;
-                        best_fit_residuals_arima = resid_hat;
-                    } else {
-                        continue;
-                    }
-                },
-                Err(_) => continue
-            }
-        }
-
-        let mut best_q_garch = 0;
-        let mut best_fit_residuals_garch: Array2<f64> = Array2::zeros((residuals_array.clone().len(), 1));
-        let mut best_garch_coef: Vec<f64> = vec![];
-        let best_aic_garch = f64::INFINITY;
-        for i in 0..(adequate_q+1) {
-            let residuals_array_clone = residuals_array.clone();
-            match fit_residuals_garch(residuals_array_clone, adequate_p, i) {
-                Some((aic, garch_coef, resid_hat)) => {
-                    if aic < best_aic_garch {
-                        best_q_garch = i;
-                        best_garch_coef = garch_coef;
-                        best_fit_residuals_garch = resid_hat;
-                    } else {
-                        continue;
-                    }
-                },
-                None => continue
-            }
-        }
-
-        if best_aic_arima < best_aic_garch {
-            result_fitted_residuals = best_fit_residuals_arima;
+    match (is_it_autocorrelated, is_it_heteroskedastic) {
+        (true, false) => {
             model_type = "arima".to_string();
-            coef = best_arima_coef;
-            p_d_q.push(adequate_p);
-            p_d_q.push(adequate_diff);
-            p_d_q.push(best_q_arima);
-            println!("adequate_p_d_q: {:?}", p_d_q);
-        } else {
-            result_fitted_residuals = best_fit_residuals_garch;
+            let residuals_array_clone = residuals_array.clone();
+            let (adequate_p, pacfs) = find_p_d_q::find_adequate_p(residuals_array_clone);
+            let residuals_array_clone = residuals_array.clone();
+            let adequate_diff = find_p_d_q::find_adequate_diff(residuals_array_clone, 0);
+            match adequate_diff {
+                Some(adequate_diff) => {
+                    let residuals_array_clone = residuals_array.clone();
+                    let (adequate_q, acfs) = find_p_d_q::find_adequate_q(residuals_array_clone);
+            
+                    let mut init_params = vec![0.0];
+                    for i in 0..(adequate_p as usize) {
+                        init_params.push(pacfs[i]);
+                    }
+                    for i in 0..(adequate_q as usize) {
+                        init_params.push(acfs[i]);
+                    }
+            
+                    let mut best_q = 0;
+                    let best_aic = f64::INFINITY;
+                    let mut check_all_q_are_none = vec![true; (adequate_q+1) as usize];
+                    for i in 0..((adequate_q+1) as usize) {
+                        let residuals_array_clone = residuals_array.clone();
+                        let init_params_clone = init_params.clone();
+                        match fit_residuals_arima(residuals_array_clone, adequate_p, adequate_diff, i as i32, init_params_clone) {
+                            Some((aic, get_coef, resid_hat_undifferentiated, _resid_residuals_hat)) => {
+                                check_all_q_are_none[i] = false;
+                                if aic < best_aic {
+                                    best_q = i;
+                                    result_fitted_residuals = Array2::from_shape_vec((residuals_array.clone().len(), 1), resid_hat_undifferentiated).unwrap();
+                                    coef = get_coef;
+                                } else {
+                                    continue;
+                                }
+                            },
+                            None => continue
+                        }
+                    }
+            
+                    _fitted = if check_all_q_are_none == vec![true; (adequate_q+1) as usize] {
+                        false
+                    } else {
+                        true
+                    };
+                    p_d_q.push(adequate_p);
+                    p_d_q.push(adequate_diff);
+                    p_d_q.push(best_q as i32);
+                },
+                None => {
+                    _fitted = false;
+                    model_type = "none".to_string();
+                }
+            }
+        },
+        (false, true) => {
             model_type = "garch".to_string();
-            coef = best_garch_coef;
+            let residuals_array_clone = residuals_array.clone();
+            let (adequate_p, pacfs) = find_p_d_q::find_adequate_p(residuals_array_clone);
+            let residuals_array_clone = residuals_array.clone();
+            let (adequate_q, acfs) = find_p_d_q::find_adequate_q(residuals_array_clone);
+    
+            let mut init_params = vec![0.0];
+            for i in 0..(adequate_p as usize) {
+                init_params.push(pacfs[i]);
+            }
+            for i in 0..(adequate_q as usize) {
+                init_params.push(acfs[i]);
+            }
+    
+            let mut best_q = 0;
+            let best_aic = f64::INFINITY;
+            let mut check_all_q_are_none = vec![true; (adequate_q+1) as usize];
+            for i in 0..((adequate_q+1) as usize) {
+                let residuals_array_clone = residuals_array.clone();
+                let init_params_clone = init_params.clone();
+                match fit_residuals_garch(residuals_array_clone, adequate_p, i as i32, init_params_clone) {
+                    Some((aic, get_coef, resid_hat)) => {
+                        check_all_q_are_none[i] = false;
+                        if aic < best_aic {
+                            best_q = i;
+                            result_fitted_residuals = resid_hat;
+                            coef = get_coef;
+                        } else {
+                            continue;
+                        }
+                    },
+                    None => continue
+                }
+            }
+    
+            _fitted = if check_all_q_are_none == vec![true; (adequate_q+1) as usize] {
+                false
+            } else {
+                true
+            };
             p_d_q.push(adequate_p);
             p_d_q.push(0);
-            p_d_q.push(best_q_garch);
-            println!("adequate_p_d_q: {:?}", p_d_q);
-        }
+            p_d_q.push(best_q as i32);
+        },
+        (true, true) => {
+            let residuals_array_clone = residuals_array.clone();
+            let adequate_diff = find_p_d_q::find_adequate_diff(residuals_array_clone, 0);
+            let residuals_array_clone = residuals_array.clone();
+            let (adequate_p, pacfs) = find_p_d_q::find_adequate_p(residuals_array_clone);
+            let residuals_array_clone = residuals_array.clone();
+            let (adequate_q, acfs) = find_p_d_q::find_adequate_q(residuals_array_clone);
+
+            let mut init_params = vec![0.0];
+            for i in 0..(adequate_p as usize) {
+                init_params.push(pacfs[i]);
+            }
+            for i in 0..(adequate_q as usize) {
+                init_params.push(acfs[i]);
+            }
+
+            let mut adequate_diff_usize = 0;
+            
+            let mut best_q_arima = 0;
+            let mut best_fit_residuals_arima: Array2<f64> = Array2::zeros((residuals_array.clone().len(), 1));
+            let mut best_arima_coef: Vec<f64> = vec![];
+            let mut best_aic_arima = f64::INFINITY;
+            let mut _arima_fitted = false;
+            match adequate_diff {
+                Some(adequate_diff) => {     
+                    adequate_diff_usize = adequate_diff.clone() as usize;      
+                    let mut check_all_arima_q_are_none = vec![true; (adequate_q+1) as usize];
+                    for i in 0..((adequate_q+1) as usize) {
+                        let residuals_array_clone = residuals_array.clone();
+                        let init_params_clone = init_params.clone();
+                        match fit_residuals_arima(residuals_array_clone, adequate_p, adequate_diff, i as i32, init_params_clone) {
+                            Some((aic, arima_coef, resid_hat_undifferentiated, _resid_residuals_hat)) => {
+                                check_all_arima_q_are_none[i] = false;
+                                if aic < best_aic_arima {
+                                    best_aic_arima = aic;
+                                    best_q_arima = i;
+                                    best_arima_coef = arima_coef;
+                                    best_fit_residuals_arima = Array2::from_shape_vec((residuals_array.clone().len(), 1), resid_hat_undifferentiated).unwrap();
+                                } else {
+                                    continue;
+                                }
+                            },
+                            None => continue
+                        }
+                    }
+                    _arima_fitted = if check_all_arima_q_are_none == vec![true; (adequate_q+1) as usize] {
+                        false
+                    } else {
+                        true
+                    };
+                },
+                None => {
+                    _arima_fitted = false;
+                }
+            }
+    
+            let mut best_q_garch = 0;
+            let mut best_fit_residuals_garch: Array2<f64> = Array2::zeros((residuals_array.clone().len(), 1));
+            let mut best_garch_coef: Vec<f64> = vec![];
+            let best_aic_garch = f64::INFINITY;
+            let mut check_all_garch_q_are_none = vec![true; (adequate_q+1) as usize];
+            for i in 0..((adequate_q+1) as usize) {
+                let residuals_array_clone = residuals_array.clone();
+                let init_params_clone = init_params.clone();
+                match fit_residuals_garch(residuals_array_clone, adequate_p, i as i32, init_params_clone) {
+                    Some((aic, garch_coef, resid_hat)) => {
+                        check_all_garch_q_are_none[i] = false;
+                        if aic < best_aic_garch {
+                            best_q_garch = i;
+                            best_garch_coef = garch_coef;
+                            best_fit_residuals_garch = resid_hat;
+                        } else {
+                            continue;
+                        }
+                    },
+                    None => continue
+                }
+            }
+            let garch_fitted = if check_all_garch_q_are_none == vec![true; (adequate_q+1) as usize] {
+                false
+            } else {
+                true
+            };
+    
+            match (_arima_fitted, garch_fitted) {
+                (true, true) => {
+                    _fitted = true;
+                    if best_aic_arima < best_aic_garch {
+                        result_fitted_residuals = best_fit_residuals_arima;
+                        model_type = "arima".to_string();
+                        coef = best_arima_coef;
+                        p_d_q.push(adequate_p);
+                        p_d_q.push(adequate_diff_usize as i32);
+                        p_d_q.push(best_q_arima as i32);
+                    } else {
+                        result_fitted_residuals = best_fit_residuals_garch;
+                        model_type = "garch".to_string();
+                        coef = best_garch_coef;
+                        p_d_q.push(adequate_p);
+                        p_d_q.push(0);
+                        p_d_q.push(best_q_garch as i32);
+                    }
+                },
+                (true, false) => {
+                    _fitted = true;
+                    result_fitted_residuals = best_fit_residuals_arima;
+                    model_type = "arima".to_string();
+                    coef = best_arima_coef;
+                    p_d_q.push(adequate_p);
+                    p_d_q.push(adequate_diff_usize as i32);
+                    p_d_q.push(best_q_arima as i32);
+                },
+                (false, true) => {
+                    _fitted = true;
+                    result_fitted_residuals = best_fit_residuals_garch;
+                    model_type = "garch".to_string();
+                    coef = best_garch_coef;
+                    p_d_q.push(adequate_p);
+                    p_d_q.push(0);
+                    p_d_q.push(best_q_garch as i32);
+                },
+                _ => {
+                    _fitted = false;
+                    result_fitted_residuals = best_fit_residuals_garch;
+                    model_type = "garch".to_string();
+                    coef = best_garch_coef;
+                    p_d_q.push(adequate_p);
+                    p_d_q.push(0);
+                    p_d_q.push(best_q_garch as i32);
+                }
+            }
+        },
+        (false, false) => {
+            model_type = "none".to_string();
+            _fitted = false;
+        },
     }
 
-    (model_type, coef, p_d_q, result_fitted_residuals)
+    match _fitted {
+        true => {
+            Some((model_type, coef, p_d_q, result_fitted_residuals))
+        },
+        false => None
+    }
 }
 
-fn simulate_time_series(input_sample: Array2<f64>, future_forcast_length: i32) -> Array2<f64> {
+fn simulate_time_series(input_sample: Array2<f64>, future_forcast_length: i32, is_this_should_be_positive: bool) -> Array2<f64> {
     let input_sample_clone = input_sample.clone();
     let time_lapse_without_future: Vec<f64> = (0..input_sample_clone.nrows() as i32).map(|x| x as f64).collect();
     let time_lapse_with_future: Vec<f64> = (0..(input_sample.nrows() as i32 + future_forcast_length) as i32).map(|x| x as f64).collect();
@@ -1135,139 +1075,169 @@ fn simulate_time_series(input_sample: Array2<f64>, future_forcast_length: i32) -
         time_series_hat.push(time_series_hat_value);
     }
     let time_series_hat_array2 = Array2::from_shape_vec((time_series_hat.len(), 1), time_series_hat).unwrap();
-    let mut result_simulated_time_series = time_series_hat_array2.clone();
-
+    let result_simulated_time_series = time_series_hat_array2.clone();
     let time_residuals = time_model.residuals().to_vec();
     let time_residuals_clone = time_residuals.clone();
     let time_residuals_array2 = Array2::from_shape_vec((time_residuals_clone.len(), 1), time_residuals_clone).unwrap();
     let time_residuals_clone = time_residuals_array2.clone();
     let (is_it_autocorrelated, is_it_heteroskedastic) = check_autocorrelation_and_heteroskedascity_of_residuals(time_model, time_residuals_clone);
     let time_residuals_clone = time_residuals_array2.clone();
-    let (resid_model_type, resid_coef, resid_p_d_q, _fitted_residuals) = fit_residuals(time_residuals_clone, is_it_autocorrelated, is_it_heteroskedastic);
-    println!("resid_model_type: {:?}", resid_model_type);
-    println!("resid_coef: {:?}", resid_coef);
+    match fit_residuals(time_residuals_clone, is_it_autocorrelated, is_it_heteroskedastic) {
+        Some((resid_model_type, resid_coef, resid_p_d_q, fitted_residuals)) => {
+            let time_residuals_clone = time_residuals.clone();
+            match resid_model_type.as_str() {
+                "arima" => {
+                    let resid_forecast = arima::forecast(
+                        &time_residuals_clone.as_slice(),
+                        &fitted_residuals.into_raw_vec().as_slice(),
+                        resid_coef,
+                        resid_p_d_q[0] as usize,
+                        resid_p_d_q[1] as usize,
+                        resid_p_d_q[2] as usize,
+                        future_forcast_length as usize,
+                    );
+                    let resid_forecast_array2 = Array2::from_shape_vec((resid_forecast.len(), 1), resid_forecast).unwrap();
+                    let tmp_simulated_time_series = result_simulated_time_series.clone() + resid_forecast_array2;
 
-    let time_residuals_clone = time_residuals.clone();
-    match resid_model_type.as_str() {
-        "arima" => {
-            let mut rng: StdRng = SeedableRng::from_seed([0; 32]);
-            let normal = Normal::new(0.0, 1.0).unwrap();
-            let resid_forecast = arima_forecast(
-                time_residuals_clone.as_slice(),
-                future_forcast_length as usize,
-                Some(resid_coef[1..((resid_p_d_q[0] + 1) as usize)].to_vec().as_slice()),
-                Some(resid_coef[((resid_p_d_q[0] + 1) as usize)..].to_vec().as_slice()),
-                resid_p_d_q[1] as usize,
-                &|_: usize, mut rng| normal.sample(&mut rng),
-                &mut rng,
-            ).unwrap();
-            let resid_forecast_array2 = Array2::from_shape_vec((resid_forecast.len(), 1), resid_forecast).unwrap();
-            result_simulated_time_series = result_simulated_time_series + resid_forecast_array2;
+                    if !is_this_should_be_positive {
+                        tmp_simulated_time_series
+                    } else {
+                        let mut tmp_is_positive = true;
+                        for i in 0..12 {
+                            if tmp_simulated_time_series[[i as usize, 0]] <= 0.0 {
+                                tmp_is_positive = false;
+                                break;
+                            }
+                        }
+                        if tmp_is_positive {
+                            tmp_simulated_time_series
+                        } else {
+                            result_simulated_time_series
+                        }
+                    }
+                },
+                "garch" => {
+                    let mut rng: StdRng = SeedableRng::from_seed([0; 32]);
+                    let normal = Normal::new(0.0, 1.0).unwrap();
+                    let resid_forecast = garch::forecast(
+                        &time_residuals_clone,
+                        future_forcast_length as usize,
+                        resid_coef[0],
+                        resid_coef[1..(resid_p_d_q[0] as usize + 1)].to_vec().as_slice(),
+                        resid_coef[(resid_p_d_q[0] as usize + 1)..].to_vec().as_slice(),
+                        &|_: usize, mut rng| normal.sample(&mut rng),
+                        &mut rng,
+                    ).unwrap().0;
+                    let resid_forecast_array2 = Array2::from_shape_vec((resid_forecast.len(), 1), resid_forecast).unwrap();
+                    let tmp_simulated_time_series = result_simulated_time_series.clone() + resid_forecast_array2;
 
-            result_simulated_time_series
+                    if !is_this_should_be_positive {
+                        tmp_simulated_time_series
+                    } else {
+                        let mut tmp_is_positive = true;
+                        for i in 0..12 {
+                            if tmp_simulated_time_series[[i as usize, 0]] <= 0.0 {
+                                tmp_is_positive = false;
+                                break;
+                            }
+                        }
+                        if tmp_is_positive {
+                            tmp_simulated_time_series
+                        } else {
+                            result_simulated_time_series
+                        }
+                    }
+                }
+                _ => {
+                    result_simulated_time_series
+                }
+            }
         },
-        "garch" => {
-            let mut rng: StdRng = SeedableRng::from_seed([0; 32]);
-            let normal = Normal::new(0.0, 1.0).unwrap();
-            let resid_forecast = garch::forecast(
-                &time_residuals_clone,
-                future_forcast_length as usize,
-                resid_coef[0],
-                resid_coef[1..(resid_p_d_q[0] as usize + 1)].to_vec().as_slice(),
-                resid_coef[(resid_p_d_q[0] as usize + 1)..].to_vec().as_slice(),
-                &|_: usize, mut rng| normal.sample(&mut rng),
-                &mut rng,
-            ).unwrap().0;
-            let resid_forecast_array2 = Array2::from_shape_vec((resid_forecast.len(), 1), resid_forecast).unwrap();
-            result_simulated_time_series = result_simulated_time_series + resid_forecast_array2;
-
-            result_simulated_time_series
-        }
-        _ => {
+        None => {
             result_simulated_time_series
         }
     }
 }
 
 fn main() {
-    // #[derive(Deserialize)]
-    // struct InputData {
-    //     input: Vec<f64>,
-    //     future_forcast_length: i32
-    // }
-    // let mut input_json = String::new();
-    // io::stdin().read_to_string(&mut input_json).expect("Failed to read input JSON");
-    // let input_data: InputData = serde_json::from_str(&input_json).expect("Failed to parse input JSON");
-    // let input = input_data.input;
-    // let input_data_array2 = Array2::from_shape_vec((input.len(), 1), input).unwrap();
-    // let future_forcast_length = input_data.future_forcast_length;
-
-    let input = vec![
-        23250000000.0,
-        23566000000.0,
-        27230000000.0,
-        22857000000.0,
-        23724000000.0,
-        24271000000.0,
-        29018000000.0,
-        24607000000.0,
-        26666000000.0,
-        26157000000.0,
-        29486000000.0,
-        24673000000.0,
-        25783000000.0,
-        24747000000.0,
-        27671000000.0,
-        23408000000.0,
-        24924000000.0,
-        23338000000.0,
-        27385000000.0,
-        22236000000.0,
-        24047000000.0,
-        22397000000.0,
-        24113000000.0,
-        19590000000.0,
-        20813000000.0,
-        19280000000.0,
-        22059000000.0,
-        18684000000.0,
-        20238000000.0,
-        19226000000.0,
-        21770000000.0,
-        18155000000.0,
-        19289000000.0,
-        19153000000.0,
-        22542000000.0,
-        19072000000.0,
-        20003000000.0,
-        18756000000.0,
-        21761000000.0,
-        18182000000.0,
-        19161000000.0,
-        18028000000.0,
-        2344000000.0,
-        17571000000.0,
-        18123000000.0,
-        17560000000.0,
-        1926000000.0,
-        13187000000.0,
-        14218000000.0,
-        13251000000.0,
-        16694000000.0,
-        14197000000.0,
-        15535000000.0,
-        14107000000.0,
-        16690000000.0,
-        14252000000.0,
-        15475000000.0,
-        14752000000.0,
-        17381000000.0
-    ];
+    #[derive(Deserialize)]
+    struct InputData {
+        input: Vec<f64>,
+        future_forcast_length: i32
+    }
+    let mut input_json = String::new();
+    io::stdin().read_to_string(&mut input_json).expect("Failed to read input JSON");
+    let input_data: InputData = serde_json::from_str(&input_json).expect("Failed to parse input JSON");
+    let input = input_data.input;
     let input_data_array2 = Array2::from_shape_vec((input.len(), 1), input).unwrap();
+    let future_forcast_length = input_data.future_forcast_length;
 
-    let future_forcast_length = 16;
+    // This is for the test. Comment out this when compiling the final product.
+    // let input = vec![
+    //     1434000000.0,
+    //     1446000000.0,
+    //     1460000000.0,
+    //     1509000000.0,
+    //     1475000000.0,
+    //     1464000000.0,
+    //     1578000000.0,
+    //     1587000000.0,
+    //     1569000000.0,
+    //     1546000000.0,
+    //     1555000000.0,
+    //     1601000000.0,
+    //     1587000000.0,
+    //     1534000000.0,
+    //     1094000000.0,
+    //     1644000000.0,
+    //     1548000000.0,
+    //     1356000000.0,
+    //     1452000000.0,
+    //     1402000000.0,
+    //     1361000000.0,
+    //     1354000000.0,
+    //     1320000000.0,
+    //     1298000000.0,
+    //     1300000000.0,
+    //     1287000000.0,
+    //     1362000000.0,
+    //     1458000000.0,
+    //     1465000000.0,
+    //     1397000000.0,
+    //     1406000000.0,
+    //     1484000000.0,
+    //     1436000000.0,
+    //     1291000000.0,
+    //     1378000000.0,
+    //     1405000000.0,
+    //     1364000000.0,
+    //     1252000000.0,
+    //     1358000000.0,
+    //     1433000000.0,
+    //     1407000000.0,
+    //     1553000000.0,
+    //     1517000000.0,
+    //     1625000000.0,
+    //     1582000000.0,
+    //     1515000000.0,
+    //     1540000000.0,
+    //     1616000000.0,
+    //     1641000000.0,
+    //     1606000000.0,
+    //     1625000000.0,
+    //     1679000000.0,
+    //     1673000000.0,
+    //     1611000000.0,
+    //     1604000000.0,
+    //     1655000000.0,
+    //     1687000000.0,
+    //     1685000000.0,
+    //     1748000000.0
+    // ];
+    // let input_data_array2 = Array2::from_shape_vec((input.len(), 1), input).unwrap();
+    // let future_forcast_length = 16;
 
-    let forcasted_time_series = simulate_time_series(input_data_array2, future_forcast_length);
+    let forcasted_time_series = simulate_time_series(input_data_array2, future_forcast_length, true);
     let forcasted_time_series_vec = forcasted_time_series.into_raw_vec();
 
     let output_json = serde_json::to_string(&forcasted_time_series_vec).unwrap();
